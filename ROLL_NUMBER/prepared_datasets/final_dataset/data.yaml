@@ -1,0 +1,10 @@
+names:
+  0: motorcycle
+  1: rider
+  2: helmet
+  3: no_helmet
+nc: 4
+path: C:\Users\Lenovo\Documents\cv_project\ROLL_NUMBER\prepared_datasets\final_dataset
+test: images/test
+train: images/train
+val: images/val
