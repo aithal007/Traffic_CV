@@ -1,0 +1,8 @@
+names:
+  0: motorcycle
+  1: rider
+nc: 2
+path: C:\Users\Lenovo\Documents\cv_project\ROLL_NUMBER\sample_dataset
+test: images/test
+train: images/train
+val: images/val
