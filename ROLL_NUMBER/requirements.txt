@@ -5,6 +5,7 @@ numpy>=1.24.0
 Pillow>=10.0.0
 
 # ── OCR (lightweight alternatives) ──────────────────────────────────────
+fast-plate-ocr
 easyocr>=1.7.0
 paddleocr>=2.8.1.3
 

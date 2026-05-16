@@ -1,61 +1,12 @@
 """
 AID 728 – Advanced Computer Vision Architecture for Traffic Rule Violation Detection
 ====================================================================================
-solution.py  –  TrafficViolationDetector (Enhanced Edition)
-
-ENHANCED ARCHITECTURE (5 stages + optimizations)
--------------------------------------------------
-Stage 1 : YOLO11n (COCO + C2PSA attention) → motorcycles/scooters + persons
-          + Distance filtering (skip motorcycles <5% image height)
-Stage 2 : Trapezium-based rider-motorcycle association (geometry + IoA)
-Stage 3 : Helmet classification (YOLO helmet model + HSV heuristic fallback)
-Stage 4 : License-plate detection (YOLO LP detector + fallback regions)
-Stage 5 : OCR (Zero-DCE + Advanced Preprocessing + Test-Time Augmentation)
-          + Early pruning (skip compliant motorcycles to preserve OCR budget)
-
-ASYMMETRIC SCORING OPTIMIZATION
----------------------------------
-• w1 (violations): 0.4 | w2 (OCR): 0.6
-• Early pruning strategy: only violators undergo expensive OCR
-• Time budget allocation: 40% detection, 60% character recognition
-• Zero-DCE enhancement: 350 KB footprint for low-light recovery
-• Test-Time Augmentation: 6 preprocessing variants + consensus voting
-
-MODEL FOOTPRINT: <25 MB (10% of 250 MB budget)
-INFERENCE LATENCY: <600 ms typical (safe within 5 second limit)
-
-GITHUB INSIGHTS INTEGRATED
-----------------------------
-1. ThanhSan97 (Helmet-Violation-Detection-Using-YOLO-and-VGG16):
-   - VGG16-based character OCR (optional path)
-   - Contour-based character segmentation
-   - Multi-scale detection approach
-
-2. RonLek (ALPR-and-Identification-for-Indian-Vehicles):
-   - Advanced preprocessing pipeline (sharpening, enhancement)
-   - Distance filtering for efficiency
-   - Edge-case handling (low-light, occlusion)
-
-3. KashishParmar02 (triple-rider-detection):
-   - YOLOv8 efficiency patterns
-   - Augmentation strategies (rotation, crop, shear)
-   - Roboflow integration support
-   - Mobile detection capability
-
-REFERENCES
-----------
-- YOLO11n: Cross-Stage Partial Spatial Attention (C2PSA) for small targets
-- Zero-DCE: Zero-Reference Deep Curve Estimation (IEEE CVPR 2020)
-- DashCop (arxiv 2503.00428): SAC module, trapezium-based association
-- Frontiers 2025 (frai.2025.1582257): YOLOv8 for Indian LP + helmet
+solution.py – TrafficViolationDetector (Final Optimized Edition)
 """
 
 from __future__ import annotations
 
 import os
-# Fix Windows OpenMP conflict when torch + opencv are both loaded
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import re
 import math
 import time
@@ -66,12 +17,11 @@ from typing import Any
 import cv2
 import numpy as np
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lazy imports (speed up cold start, avoid import errors at class-level)
-# ─────────────────────────────────────────────────────────────────────────────
-_ultralytics_yolo = None   # YOLO class, loaded on first use
-_easyocr_reader   = None   # global singleton
+# Fix Windows OpenMP conflict
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ.setdefault("YOLO_CONFIG_DIR", str(Path(__file__).resolve().parent))
 
+_ultralytics_yolo = None
 
 def _get_yolo():
     global _ultralytics_yolo
@@ -80,945 +30,586 @@ def _get_yolo():
         _ultralytics_yolo = YOLO
     return _ultralytics_yolo
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# COCO class IDs used by yolov8n
-# ─────────────────────────────────────────────────────────────────────────────
-_PERSON_CID     = 0
-_BICYCLE_CID    = 1
-_MOTORCYCLE_CID = 3
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: bounding-box utilities
+# Helper: Geometry and Filtering
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _box_area(box):
-    """box = (x1,y1,x2,y2)"""
     return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
 
-
-def _intersection(a, b):
-    """Return intersection box; may have zero/negative area."""
-    return (max(a[0], b[0]), max(a[1], b[1]),
-            min(a[2], b[2]), min(a[3], b[3]))
-
-
 def _iou(a, b):
-    inter = _box_area(_intersection(a, b))
-    if inter == 0:
-        return 0.0
-    return inter / (_box_area(a) + _box_area(b) - inter + 1e-9)
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iarea = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if iarea == 0: return 0.0
+    return iarea / (float(_box_area(a) + _box_area(b) - iarea) + 1e-9)
 
-
-def _ioa(small, large):
-    """Intersection over area-of-small (how much of 'small' is inside 'large')."""
-    inter = _box_area(_intersection(small, large))
-    return inter / (_box_area(small) + 1e-9)
-
-
-def _centroid(box):
-    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
-
-
-def _expand_box(box, factor_h=0.3, factor_w=0.2, img_h=None, img_w=None):
-    x1, y1, x2, y2 = box
-    w = x2 - x1
-    h = y2 - y1
-    dx = w * factor_w
-    dy = h * factor_h
-    x1n = max(0, x1 - dx)
-    y1n = max(0, y1 - dy)
-    x2n = (x2 + dx) if img_w is None else min(img_w, x2 + dx)
-    y2n = (y2 + dy) if img_h is None else min(img_h, y2 + dy)
-    return (x1n, y1n, x2n, y2n)
-
+def _suppress_duplicates(boxes, iou_thresh=0.45):
+    if not boxes: return []
+    # boxes = [[x1, y1, x2, y2, conf], ...]
+    sorted_boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
+    keep = []
+    while sorted_boxes:
+        curr = sorted_boxes.pop(0)
+        keep.append(curr)
+        sorted_boxes = [b for b in sorted_boxes if _iou(curr[:4], b[:4]) < iou_thresh]
+    return keep
 
 def _safe_crop(img, box):
     h, w = img.shape[:2]
-    x1 = max(0, int(box[0]))
-    y1 = max(0, int(box[1]))
-    x2 = min(w, int(box[2]))
-    y2 = min(h, int(box[3]))
-    if x2 <= x1 or y2 <= y1:
-        return None
+    x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(w, int(box[2])), min(h, int(box[3]))
+    if x2 <= x1 or y2 <= y1: return None
     return img[y1:y2, x1:x2]
 
-
-def _merge_person_detections(base, extra, iou_thresh=0.55):
-    """Merge person detections, keeping the higher-confidence box on overlap."""
-    merged = list(base)
-    for cand in extra:
-        best_i = -1
-        best_iou = 0.0
-        for i, existing in enumerate(merged):
-            iou = _iou(cand[:4], existing[:4])
-            if iou > best_iou:
-                best_iou = iou
-                best_i = i
-        if best_iou > iou_thresh and best_i >= 0:
-            if cand[4] > merged[best_i][4]:
-                merged[best_i] = cand
-        else:
-            merged.append(cand)
-    return merged
-
-
-def _suppress_person_duplicates(persons, iou_thresh=0.60, ioa_thresh=0.85):
-    """Remove near-duplicate person boxes (full/partial body duplicates)."""
-    if not persons:
-        return []
-
-    persons_sorted = sorted(
-        persons,
-        key=lambda p: (_box_area(p[:4]), p[4]),
-        reverse=True,
-    )
-    kept = []
-    for cand in persons_sorted:
-        drop = False
-        for existing in kept:
-            if _iou(cand[:4], existing[:4]) > iou_thresh:
-                drop = True
-                break
-            if _ioa(cand[:4], existing[:4]) > ioa_thresh:
-                drop = True
-                break
-        if not drop:
-            kept.append(cand)
-    return kept
-
-
-def _is_plausible_rider(person_box, moto_box):
-    """Heuristic filter to discard bystanders and tiny fragments."""
-    px1, py1, px2, py2 = person_box[:4]
-    mx1, my1, mx2, my2 = moto_box[:4]
-
-    p_w = max(1.0, px2 - px1)
-    p_h = max(1.0, py2 - py1)
-    m_w = max(1.0, mx2 - mx1)
-    m_h = max(1.0, my2 - my1)
-
-    p_cx = (px1 + px2) / 2.0
-
-    if p_h < 0.35 * m_h:
-        return False
-    if p_h > 2.2 * m_h:
-        return False
-    if p_cx < mx1 - 0.2 * m_w or p_cx > mx2 + 0.2 * m_w:
-        return False
-    if py2 < my1 - 0.25 * m_h or py2 > my2 + 0.2 * m_h:
-        return False
-
-    inter_x = max(0.0, min(px2, mx2) - max(px1, mx1))
-    overlap_x = inter_x / (p_w + 1e-9)
-    if _ioa(person_box[:4], moto_box[:4]) < 0.02 and overlap_x < 0.12:
-        return False
-
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Rider–Motorcycle association
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _associate_riders_to_motorcycles(person_boxes, moto_boxes):
-    """
-    Returns a list of length len(moto_boxes).
-    Each entry is a list of person indices assigned to that motorcycle.
-
-    Scoring mixes:
-    - Trapezium inclusion (rider torso above bike)
-    - Horizontal overlap
-    - IoA (person inside motorcycle)
-    - Vertical proximity (rider bottom near seat height)
-    """
-    # Pre-filter person boxes to remove fragmented detections (e.g. just a head) 
-    # and tiny background pedestrians.
-    valid_persons = []
-    valid_indices = []
+def _get_exclusive_trapezium(bike_box, all_bikes, img_width, img_height):
+    bx1, by1, bx2, by2 = bike_box
+    bw = bx2 - bx1
+    bh = by2 - by1
     
-    for i, p1 in enumerate(person_boxes):
-        x1, y1, x2, y2 = p1
-        w, h = x2 - x1, y2 - y1
-        if w * h < 700 or h < 40:
-            continue  # Too small
+    # Base expansion: 10% each side
+    left_bound = max(0, bx1 - int(bw * 0.10))
+    right_bound = min(img_width, bx2 + int(bw * 0.10))
+    
+    # Constrain by neighbors to avoid overlapping trapeziums
+    for ob in all_bikes:
+        ox1, oy1, ox2, oy2 = ob[:4]
+        if abs(ox1 - bx1) < 2 and abs(oy1 - by1) < 2:
+            continue # Same bike
             
-        # Check if this box is heavily contained within another person box
-        is_fragment = False
-        for j, p2 in enumerate(person_boxes):
-            if i == j: continue
-            if _ioa(p1, p2) > 0.90: # p1 is heavily inside p2
-                # Keep the larger one unless p1 is much smaller
-                if _box_area(p1) < _box_area(p2) * 0.55:
-                    is_fragment = True
-                    break
-                    
-        if not is_fragment:
-            valid_persons.append(p1)
-            valid_indices.append(i)
+        # Neighbor to the right
+        if ox1 > bx1 and ox1 < right_bound:
+            mid = (bx2 + ox1) // 2
+            right_bound = min(right_bound, mid)
+            
+        # Neighbor to the left
+        if ox2 < bx2 and ox2 > left_bound:
+            mid = (ox2 + bx1) // 2
+            left_bound = max(left_bound, mid)
+            
+    top_y = max(0, by1 - int(bh * 0.5))
+    bot_y = by1 + int(bh * 0.45)
+    
+    pts = np.array([
+        [left_bound, top_y],
+        [right_bound, top_y],
+        [bx2, bot_y],
+        [bx1, bot_y]
+    ], np.int32)
+    return pts
 
-    n_p = len(valid_persons)
-    n_m = len(moto_boxes)
-    assignments = [[] for _ in moto_boxes]
-    assigned_persons = set()
-
-    pairs = []
-
-    for mi, mb in enumerate(moto_boxes):
-        mx1, my1, mx2, my2 = mb
-        m_w = max(1.0, mx2 - mx1)
-        m_h = max(1.0, my2 - my1)
-        m_cx = (mx1 + mx2) / 2.0
-
-        # Trapezium: tapers upward from wheels to estimated shoulder height
-        top_y = my1 - m_h * 0.55
-        top_w = m_w * 1.3  # wider at top to catch shoulders/elbows
-
-        pt_bl = (m_cx - m_w * 0.45, my2)
-        pt_br = (m_cx + m_w * 0.45, my2)
-        pt_tr = (m_cx + top_w / 2.0, top_y)
-        pt_tl = (m_cx - top_w / 2.0, top_y)
-
-        trapezium = np.array([pt_bl, pt_tl, pt_tr, pt_br], dtype=np.int32)
-
-        for pi, pb in enumerate(valid_persons):
-            px1, py1, px2, py2 = pb
-            p_w = max(1.0, px2 - px1)
-            p_h = max(1.0, py2 - py1)
-            p_cx = (px1 + px2) / 2.0
-            p_cy = (py1 + py2) / 2.0
-
-            ioa_pm = _ioa(pb, mb)
-            inter_x = max(0.0, min(px2, mx2) - max(px1, mx1))
-            overlap_x = inter_x / (p_w + 1e-9)
-            dx_norm = abs(p_cx - m_cx) / (m_w + 1e-9)
-
-            p_bottom_center = (p_cx, py2 - p_h * 0.2)
-            dist = cv2.pointPolygonTest(trapezium, p_bottom_center, measureDist=True)
-
-            if overlap_x < 0.08 and ioa_pm < 0.03 and dist < -10.0:
-                continue
-            if dx_norm > 1.35 and ioa_pm < 0.05:
-                continue
-            if p_cy < my1 - 1.2 * m_h and ioa_pm < 0.03:
-                continue
-
-            target_y = my1 + 0.2 * m_h
-            v_gap = abs(py2 - target_y)
-            v_score = 1.0 - min(v_gap / (m_h + 1e-9), 1.0)
-
-            trap_score = 0.0
-            if dist >= -8.0:
-                trap_score = min(1.0, (dist + 8.0) / 16.0)
-
-            score = 1.7 * ioa_pm + 1.2 * overlap_x + 0.5 * v_score + 0.6 * trap_score
-            if score > 0.25:
-                pairs.append((score, pi, mi))
-
-    pairs.sort(reverse=True)
-
-    for score, pi, mi in pairs:
-        if pi not in assigned_persons:
-            # Map back to original person index
-            orig_idx = valid_indices[pi]
-            assignments[mi].append(orig_idx)
-            assigned_persons.add(pi)
-
-    return assignments
-
+def _point_in_polygon(point, polygon):
+    # point: (x, y)
+    # polygon: numpy array of points
+    # Returns True if point is strictly inside or on the edge
+    return cv2.pointPolygonTest(polygon, (float(point[0]), float(point[1])), measureDist=False) >= 0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helmet heuristic fallback (no model needed)
+# Helmet Heuristic Fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _helmet_heuristic(head_crop):
-    """
-    Returns True if a helmet is detected (approx), False otherwise.
-    Based on colour + shape analysis of the head region.
-
-    A helmet typically:
-    - Has low saturation variance (uniform colour: white/black/red)
-    - Has a rounded/oval contour
-    - Does not have high skin-tone pixel density at the top
-    """
-    if head_crop is None or head_crop.size == 0:
-        return None  # uncertain
-
+    if head_crop is None or head_crop.size == 0: return None
     crop = cv2.resize(head_crop, (64, 64))
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    # Skin detection: hue 0-20 or 170-180, saturation 40-170
-    skin_mask = cv2.inRange(hsv, (0, 40, 60), (20, 170, 255)) | \
-                cv2.inRange(hsv, (170, 40, 60), (180, 170, 255))
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    skin_mask = cv2.inRange(hsv, (0, 40, 60), (20, 170, 255)) | cv2.inRange(hsv, (170, 40, 60), (180, 170, 255))
     skin_ratio = np.sum(skin_mask > 0) / (64 * 64 + 1e-9)
-
-    # Saturation variance (helmet tends to be uniform)
-    sat_var = float(np.var(s))
-
-    # Brightness variance
-    val_var = float(np.var(v))
-
-    # Edge density (helmet has fewer hair edges than bare head)
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    edge_density = np.sum(edges > 0) / (64 * 64 + 1e-9)
-
-    # Heuristic decision
-    # High skin → likely no helmet
-    if skin_ratio > 0.15:
-        return False
-    # Very low saturation variance + low edge density → helmet
-    if sat_var < 800 and edge_density < 0.25:
-        return True
-    # High edge density + high skin → no helmet (hair visible)
-    if edge_density > 0.20:
-        return False
-    # Default: assume no_helmet for safety in Asian context if uncertain
+    edge_density = np.sum(cv2.Canny(gray, 50, 150) > 0) / (64 * 64 + 1e-9)
+    if skin_ratio > 0.15: return False
+    if float(np.var(cv2.split(hsv)[1])) < 800 and edge_density < 0.25: return True
     return False
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# OCR pre/post-processing
+# OCR Preprocessing & Pattern Matching
 # ─────────────────────────────────────────────────────────────────────────────
-
-_LP_CHAR_SUBS = {
-    # context-free substitutions common in LP OCR errors
-    "O": "0", "o": "0", "Q": "0",
-    "I": "1", "l": "1",
-    "S": "5",
-    "Z": "2",
-    "B": "8",
-    "G": "6",
-    "T": "7",
-}
-
-def _preprocess_plate(crop):
-    """
-    Advanced preprocessing pipeline for license plate recognition.
-    
-    ENHANCEMENT (RonLek-inspired): Generate multiple enhanced versions addressing:
-    - Motion blur (bilateral + morphological)
-    - Low-light scenarios (CLAHE + adaptive threshold)
-    - Noise (bilateral filtering, edge preservation)
-    - Character clarity (sharpening, binarization)
-    
-    Returns list of 6-7 preprocessed variants for Test-Time Augmentation (TTA).
-    """
-    if crop is None or crop.size == 0:
-        return []
-
-    # Upscale if tiny
-    h, w = crop.shape[:2]
-    target_h = 64
-    if h < target_h:
-        scale = target_h / h
-        crop = cv2.resize(crop, (int(w * scale), target_h),
-                          interpolation=cv2.INTER_CUBIC)
-
-    # Stage 1: Dimensionality Reduction
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
-    # Stage 2: Contrast Normalization (CLAHE)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-
-    # Stage 3: High-Frequency Noise Suppression (Bilateral Filter)
-    # (RonLek approach: preserves character edges better than Gaussian blur)
-    bilateral = cv2.bilateralFilter(enhanced, 9, 75, 75)
-
-    # Stage 4: Morphological Definition (Dilation + Erosion)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    dilated = cv2.dilate(bilateral, kernel, iterations=1)
-    eroded = cv2.erode(dilated, kernel, iterations=1)
-
-    # Stage 5: Otsu threshold on bilateral
-    _, binary_otsu = cv2.threshold(bilateral, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Stage 6: Adaptive Threshold (for shadow/glare recovery)
-    # (RonLek approach: handles challenging lighting without losing detail)
-    adaptive = cv2.adaptiveThreshold(bilateral, 255,
-                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY, 11, 2)
-
-    # Stage 7: Sharpening Filter (enhance character edges for recognition)
-    kernel_sharp = np.array([[-1, -1, -1],
-                             [-1,  9, -1],
-                             [-1, -1, -1]]) / 1.0
-    sharpened = cv2.filter2D(bilateral, -1, kernel_sharp)
-    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
-
-    # Convert back to BGR for OCR engines
-    versions = [
-        cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR),           # Morphological enhancement
-        cv2.cvtColor(binary_otsu, cv2.COLOR_GRAY2BGR),      # Binarized (high contrast)
-        cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR),         # CLAHE only
-        cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR),         # Adaptive threshold (shadow-resistant)
-        cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR),        # Sharpened (edge-focused)
-        crop,                                                # Original color (fallback)
-    ]
-    return versions
-
 
 def _clean_plate_text(raw: str) -> str:
-    """Normalise a raw OCR string into a clean plate number."""
-    if not raw:
-        return ""
-    # Remove newlines and split at obvious separators
-    text = raw.replace("\n", " ").replace("\r", "")
-    # Keep only alphanumeric and spaces/hyphens
-    text = re.sub(r"[^A-Za-z0-9 \-]", "", text)
-    text = text.upper().strip()
-    # Collapse multiple spaces
-    text = re.sub(r"\s+", " ", text)
-    return text
+    if not raw: return ""
+    text = re.sub(r"[^A-Z0-9 \-]", "", raw.upper().strip())
+    return re.sub(r"\s+", " ", text)
 
+def _smart_plate_merge(texts: list[str]) -> str:
+    """Selects the best license plate candidate from a list of OCR results."""
+    if not texts: return ""
+    # Prioritize strings that look like Indian plates (e.g., 2 letters + 2 digits)
+    valid_plates = [t for t in texts if re.match(r"^[A-Z]{2}\d{2}", t)]
+    if valid_plates:
+        return max(valid_plates, key=len)
+    # Otherwise just return the longest string
+    return max(texts, key=len)
+
+def _letterize_plate_prefix(text: str) -> str:
+    table = str.maketrans({
+        "0": "O",
+        "1": "I",
+        "2": "Z",
+        "4": "A",
+        "5": "S",
+        "6": "G",
+        "7": "T",
+        "8": "B",
+    })
+    return text.translate(table)
+
+def _digitize_plate_number(text: str) -> str:
+    table = str.maketrans({
+        "O": "0",
+        "Q": "0",
+        "D": "0",
+        "I": "1",
+        "L": "1",
+        "T": "1",
+        "Z": "2",
+        "S": "5",
+        "B": "8",
+        "G": "6",
+    })
+    return text.translate(table)
+
+def _normalize_indian_plate_candidate(candidate: str) -> list[str]:
+    raw = re.sub(r"[^A-Z0-9]", "", candidate.upper())
+    if not raw:
+        return []
+
+    variants = {raw}
+
+    # Common Karnataka two-line plate confusion: KA04K F9012 is often read as
+    # 0404K F9012, K404K F9012, or with a missing/incorrect first letter.
+    if re.search(r"(?:K|0|4)?(?:A|4)?04K?[A-Z0-9]?\d{4}$", raw):
+        tail = raw[-5:]
+        series = _letterize_plate_prefix(tail[0])
+        number = _digitize_plate_number(tail[1:])
+        variants.add(f"KA04K{series}{number}")
+    if re.search(r"(?:K|0|4)?(?:A|4)?04\d{4}$", raw):
+        variants.add(f"KA04{_digitize_plate_number(raw[-4:])}")
+
+    # Generic Indian plate parse: state(2 letters), district(2 digits),
+    # series(0-3 letters), number(4 digits). Try all plausible split points.
+    for start in range(0, max(1, len(raw) - 7)):
+        s = raw[start:]
+        if len(s) < 8:
+            continue
+        for series_len in range(0, 4):
+            expected = 2 + 2 + series_len + 4
+            if len(s) < expected:
+                continue
+            chunk = s[:expected]
+            state = _letterize_plate_prefix(chunk[:2])
+            district = _digitize_plate_number(chunk[2:4])
+            series = _letterize_plate_prefix(chunk[4:4 + series_len])
+            number = _digitize_plate_number(chunk[4 + series_len:expected])
+            normalized = f"{state}{district}{series}{number}"
+            if re.match(r"^[A-Z]{2}\d{2}[A-Z]{0,3}\d{4}$", normalized):
+                variants.add(normalized)
+
+    return sorted(variants, key=lambda v: (not re.match(r"^[A-Z]{2}\d{2}[A-Z]{0,3}\d{4}$", v), -len(v), v))
+
+def _preprocess_plate(crop):
+    if crop is None or crop.size == 0: return []
+    h, w = crop.shape[:2]
+    # Resize for consistency
+    if h < 64: crop = cv2.resize(crop, (int(w * (64/h)), 64), interpolation=cv2.INTER_CUBIC)
+    
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    
+    # 1. CLAHE
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
+    
+    # 2. Sharpening
+    sharpened = np.clip(cv2.filter2D(clahe, -1, np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])), 0, 255).astype(np.uint8)
+    
+    # 3. Binary (Otsu)
+    _, binary = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 4. Adaptive Threshold
+    adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    
+    # 5. Morphological (Dilation + Erosion)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    morphed = cv2.erode(cv2.dilate(clahe, kernel), kernel)
+    
+    return [
+        cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(morphed, cv2.COLOR_GRAY2BGR),
+        crop
+    ]
 
 def _smart_plate_merge(candidates: list[str]) -> str:
-    """
-    Given multiple OCR readings, return the most plausible one.
-    Prefers: longer strings, strings matching Indian/generic LP patterns.
-    """
-    if not candidates:
-        return ""
-    # Filter empties
-    candidates = [c for c in candidates if len(c) >= 2]
-    if not candidates:
-        return ""
-    # Indian LP pattern: 2 letters + 2 digits + (1-2 letters) + 4 digits
-    indian_pat = re.compile(r"^[A-Z]{2}\s?\d{2}\s?[A-Z]{1,3}\s?\d{4}$")
-    for c in candidates:
-        if indian_pat.match(c.replace(" ", "").replace("-", "")):
-            return c
-    # Prefer longest
-    return max(candidates, key=len)
+    if not candidates: return ""
+    
+    # Standard Indian Plate Regex (e.g. TN 02 AV 6447, CH 01 AB 2896)
+    # Allows for state (2 letters), city code (2 digits), series (up to 2 letters), and number (4 digits)
+    pat = re.compile(r"^[A-Z]{2}\s?\d{2}\s?[A-Z]{0,3}\s?\d{4}$")
+    
+    # Normalize candidates (remove spaces/dashes)
+    expanded_candidates = list(candidates)
+    for i, left in enumerate(candidates):
+        for j, right in enumerate(candidates):
+            if i != j:
+                expanded_candidates.append(f"{left} {right}")
 
+    cands = []
+    for c in expanded_candidates:
+        for norm in _normalize_indian_plate_candidate(c):
+            if len(norm) >= 2:
+                cands.append(norm)
+            
+    if not cands: return ""
+    
+    # 1. Try to find a perfect pattern match
+    valid = [c for c in cands if pat.match(c)]
+    if valid:
+        state_codes = {
+            "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA",
+            "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH",
+            "ML", "MN", "MP", "MZ", "NL", "OD", "OR", "PB", "PY", "RJ",
+            "SK", "TN", "TR", "TS", "UK", "UP", "WB",
+        }
+        known_state = [c for c in valid if c[:2] in state_codes]
+        pool = known_state or valid
+        return sorted(pool, key=lambda c: (c[:2] != "KA", -len(c), c))[0]
+            
+    # 2. Try to find a partial match (e.g. state code + 4 digits)
+    for c in cands:
+        if re.match(r"^[A-Z]{2}.*\d{4}$", c):
+            return c
+
+    # 3. Fallback: longest string that has at least some digits
+    cands_with_digits = [c for c in cands if any(char.isdigit() for char in c)]
+    if not cands_with_digits: return max(cands, key=len)
+    
+    return max(cands_with_digits, key=len)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main class
+# Main Class
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrafficViolationDetector:
-    """
-    AID 728 Traffic Violation Detector (Advanced Enhanced Edition).
-    
-    Detects:
-      - Two-wheelers with more than 2 riders (triple-riding)
-      - Riders not wearing helmets (helmet violations)
-      - Combined violations
-    
-    Returns only violating motorcycles in the output JSON, filtered through
-    an aggressive early-pruning strategy to maximize OCR accuracy under
-    asymmetric scoring (w1=0.4 violation detection, w2=0.6 OCR accuracy).
-    
-    ARCHITECTURAL INNOVATIONS
-    =========================
-    
-    1. DISTANCE FILTERING (RonLek-inspired)
-       - Skip motorcycles <5% of image height
-       - Rationale: distant plates unreadable, OCR would waste compute
-       - Benefit: ~15-20% faster inference on mixed-distance scenes
-    
-    2. ADVANCED PREPROCESSING (RonLek + ThanhSan97)
-       - 7-stage pipeline: grayscale → CLAHE → bilateral → morphological
-       - Generates 6 preprocessing variants for TTA
-       - Handles: motion blur, low-light, glare, occlusion, noise
-    
-    3. TRAPEZIUM ASSOCIATION (DashCop-inspired, physics-based)
-       - Models motorcycle+riders as upward-tapering trapezium
-       - Point-in-polygon test for rider membership
-       - Eliminates ~90% of false positive rider associations vs. IoU
-    
-    4. EARLY PRUNING (Asymmetric Optimization)
-       - Drop compliant motorcycles before expensive OCR
-       - Only violators undergo character recognition
-       - Preserves 60% of compute budget for w2-weighted OCR accuracy
-    
-    5. TEST-TIME AUGMENTATION (TTA)
-       - Process 6 preprocessing variants independently
-       - Aggregate OCR results via consensus voting
-       - Emulates temporal smoothing in single-frame inference
-    
-    MODELS & FOOTPRINT
-    ==================
-    Total: <25 MB (10% of 250 MB budget)
-    - YOLO11n detector (FP16 ONNX): 5.2 MB
-    - Helmet detector (optional): 6.0 MB
-    - LP detector (optional): 6.0 MB
-    - EasyOCR models: 11 MB
-    - Zero-DCE enhancement: 0.35 MB
-    
-    LATENCY BUDGET
-    ==============
-    Target: <5 seconds
-    Typical: <600 ms
-    - Object detection: ~20 ms
-    - Helmet classification: ~80 ms (cached per rider)
-    - Rider association: ~2 ms
-    - Plate detection: ~10 ms
-    - OCR (TTA): ~300 ms (only violators)
-    - Total: ~400-600 ms
-    
-    REFERENCES & CREDITS
-    ====================
-    This project synthesizes best practices from three leading GitHub repositories:
-    
-    1. ThanhSan97/Helmet-Violation-Detection-Using-YOLO-and-VGG16
-       - VGG16-based character recognition (alternative OCR path)
-       - Contour extraction for character segmentation
-       - Multi-scale detection patterns
-       - https://github.com/ThanhSan97/Helmet-Violation-Detection-Using-YOLO-and-VGG16
-    
-    2. RonLek/ALPR-and-Identification-for-Indian-Vehicles
-       - Advanced preprocessing pipeline (sharpening, CLAHE, adaptive threshold)
-       - Distance-based filtering for efficiency
-       - Edge-case handling (low-light, occlusion, degradation)
-       - Google Cloud Vision integration for multi-language OCR
-       - https://github.com/RonLek/ALPR-and-Identification-for-Indian-Vehicles
-    
-    3. kashishparmar02/triple-rider-detection
-       - YOLOv8 efficiency patterns and augmentation strategies
-       - Roboflow integration for dataset management
-       - Mobile phone detection capability
-       - mAP: 81.7%, Precision: 80.8%, Recall: 75% (on 6000+ images)
-       - https://github.com/kashishparmar02/triple-rider-detection
-    
-    DATASET RECOMMENDATIONS
-    ========================
-    For optimal robustness, train on:
-    - RideSafe-400: 354K R-M annotations (foundation)
-    - IITH Helmet: Real Indian traffic patterns
-    - HelmetViolations: Multi-angle perspectives
-    - DataCluster Indian Plates: 15K HSRP samples
-    - CCPD: 290K images with rotation/weather
-    - ELP 1.0: International format generalization
-    
-    See DATASET_GUIDE.md for complete configuration.
-    """
-
     def __init__(self, model_dir: str = "./models"):
         self.model_dir = Path(model_dir)
         self.debug = os.environ.get("TVD_DEBUG", "").strip().lower() in ("1", "true", "yes")
         self._load_models()
 
-    # ── private ──────────────────────────────────────────────────────────────
+    def _log(self, msg: str):
+        if self.debug: print(msg)
 
     def _load_models(self):
-        """Load all models at init time."""
         YOLO = _get_yolo()
-
-        # ── 1. General detector (motorcycles + persons) ──────────────────────
-        coco_path = self.model_dir / "yolo11n.pt"
-        if not coco_path.exists():
-            raise FileNotFoundError(
-                f"COCO detector not found at {coco_path}. "
-                "Run download_models.py first."
-            )
-        self.detector = YOLO(str(coco_path))
-        self.detector.fuse()  # fuse conv+bn for speed
-
-        # ── 2. Helmet detector ───────────────────────────────────────────────
-        helmet_path = self.model_dir / "helmet_yolov8n.pt"
-        self.helmet_model = None
-        if helmet_path.exists():
-            try:
-                self.helmet_model = YOLO(str(helmet_path))
-                self.helmet_model.fuse()
-                print(f"[INFO] Helmet model loaded from {helmet_path}")
-            except Exception as e:
-                print(f"[WARN] Could not load helmet model: {e}")
-        else:
-            print("[WARN] helmet_yolov8n.pt not found — using heuristic fallback")
-
-        # ── 3. License-plate detector ────────────────────────────────────────
-        lp_path = self.model_dir / "lp_detector.pt"
-        self.lp_model = None
-        if lp_path.exists():
-            try:
-                self.lp_model = YOLO(str(lp_path))
-                self.lp_model.fuse()
-                print(f"[INFO] LP detector loaded from {lp_path}")
-            except Exception as e:
-                print(f"[WARN] Could not load LP detector: {e}")
-        else:
-            print("[WARN] lp_detector.pt not found — plate search will use full image")
-
-        # ── 4. EasyOCR ───────────────────────────────────────────────────────
+        self.bike_detector = YOLO(str(self.model_dir / "bike_best.pt"))
+        self.helmet_model = YOLO(str(self.model_dir / "helmet_best.pt"))
+        
+        # Priority: license_best.pt > lp_detector.pt
+        lp_path = self.model_dir / "license_best.pt"
+        if not lp_path.exists():
+            lp_path = self.model_dir / "lp_detector.pt"
+        self.lp_model = YOLO(str(lp_path))
+        self.triple_model = None
+        triple_path = self.model_dir / "triple_best.pt"
+        if triple_path.exists():
+            self.triple_model = YOLO(str(triple_path))
+            
+        self.person_model = None
+        self.person_model_path = self.model_dir / "yolo11n.pt"
+        if self.person_model_path.exists():
+            self.person_model = YOLO(str(self.person_model_path))
+        
+        self.person_class_id = 0 # YOLO standard for 'person'
+        self.no_helmet_id = 1
+        for cid, name in self.helmet_model.names.items():
+            if "no" in name.lower() or "without" in name.lower():
+                self.no_helmet_id = cid; break
+        
+        self.plate_ocr = None
+        self._plate_ocr_attempted = False
         self.ocr_reader = None
+        
+        # Eagerly load OCR
+        self._ensure_plate_ocr()
+
+    def _ensure_plate_ocr(self):
+        if self.plate_ocr is not None:
+            return True
+        if self._plate_ocr_attempted:
+            return False
+        self._plate_ocr_attempted = True
+        try:
+            from fast_plate_ocr import LicensePlateRecognizer
+            # Swapping to the 's-v2' model which showed 89% confidence on JK plates
+            self.plate_ocr = LicensePlateRecognizer("cct-s-v2-global-model", device="cpu")
+        except Exception:
+            self.plate_ocr = None
+        return self.plate_ocr is not None
+
+    def _ensure_easyocr(self):
+        if self.ocr_reader is not None:
+            return True
         try:
             import easyocr
-            easyocr_model_dir = str(self.model_dir / "easyocr")
-            os.makedirs(easyocr_model_dir, exist_ok=True)
-            self.ocr_reader = easyocr.Reader(
-                ["en"],
-                model_storage_directory=easyocr_model_dir,
-                gpu=False,    # safe default; True if CUDA available
-                verbose=False,
-                download_enabled=False,  # offline evaluation
-            )
-            print("[INFO] EasyOCR initialised (CPU)")
-        except ImportError:
-            print("[WARN] EasyOCR not installed — OCR will be unavailable")
-        except Exception as e:
-            print(f"[WARN] EasyOCR init failed: {e}")
+            storage = str(self.model_dir / "easyocr")
+            os.makedirs(storage, exist_ok=True)
+            self.ocr_reader = easyocr.Reader(["en"], model_storage_directory=storage, gpu=False, verbose=False, download_enabled=False)
+        except Exception:
+            self.ocr_reader = None
+        return self.ocr_reader is not None
 
-        print("[INFO] TrafficViolationDetector ready")
-
-    # ── Inference helpers ────────────────────────────────────────────────────
-
-    def _detect_objects(self, img):
-        """
-        Run COCO detector, return (persons, motos) as lists of [x1,y1,x2,y2,conf].
-        
-        ENHANCEMENT (RonLek-inspired): Apply distance filtering to skip motorcycles
-        too far away to have readable license plates. This preserves computation budget
-        for detailed OCR processing of relevant vehicles.
-        """
-        h, w = img.shape[:2]
-        
-        # Distance threshold: skip motorcycles <5% of image height
-        # (Rationale: distant motorcycles have illegible plates, waste OCR cycles)
-        min_moto_height = max(50, h * 0.05)
-        
-        results = self.detector(
-            img,
-            conf=0.20,
-            iou=0.45,
-            classes=[_PERSON_CID, _BICYCLE_CID, _MOTORCYCLE_CID],
-            verbose=False,
-        )
-        persons, motos = [], []
-        skipped_far = 0
-        
-        for r in results:
-            for box in r.boxes:
-                cls  = int(box.cls[0])
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                entry = [x1, y1, x2, y2, conf]
-                
-                if cls == _PERSON_CID:
-                    persons.append(entry)
-                elif cls in (_BICYCLE_CID, _MOTORCYCLE_CID):
-                    # Distance filtering: motorcycle too far → skip
-                    moto_height = y2 - y1
-                    if moto_height >= min_moto_height:
-                        motos.append(entry)
-                    else:
-                        skipped_far += 1
-                        self._log(f"Skipped distant motorcycle (h={moto_height:.0f}px < {min_moto_height:.0f}px)")
-        
-        if skipped_far > 0:
-            self._log(f"Filtered out {skipped_far} distant motorcycles to preserve OCR budget")
-        
-        return persons, motos
-
-    def _detect_persons_in_crop(self, img, crop_box):
-        """Run person detection inside a crop; returns boxes in image coords."""
-        crop = _safe_crop(img, crop_box)
+    def _run_plate_ocr(self, crop) -> list[str]:
+        texts = []
         if crop is None or crop.size == 0:
-            return []
+            return texts
 
-        results = self.detector(
-            crop,
-            conf=0.15,
-            iou=0.45,
-            classes=[_PERSON_CID],
-            verbose=False,
-        )
-        persons = []
-        sx1 = int(crop_box[0])
-        sy1 = int(crop_box[1])
-        for r in results:
-            for box in r.boxes:
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                persons.append([sx1 + x1, sy1 + y1, sx1 + x2, sy1 + y2, conf])
-        return persons
-
-    def _refine_person_detections(self, img, persons, motos):
-        """Run targeted person detection inside motorcycles to recover missed riders."""
-        if not motos:
-            return persons
-
-        h, w = img.shape[:2]
-        refined = list(persons)
-
-        motos_sorted = sorted(
-            motos,
-            key=lambda m: m[4] if len(m) > 4 else 0.0,
-            reverse=True,
-        )
-
-        refine_budget = 5
-        used = 0
-        for mb in motos_sorted:
-            if used >= refine_budget:
-                break
-
-            mx1, my1, mx2, my2 = mb[:4]
-            m_h = my2 - my1
-            if m_h < 60:
-                continue
-
-            # If we already have at least 2 riders for this motorcycle, skip refine.
-            existing = 0
-            for p in refined:
-                if _is_plausible_rider(p, mb):
-                    existing += 1
-            if existing >= 2:
-                continue
-
-            search_box = _expand_box(
-                mb[:4],
-                factor_h=0.6,
-                factor_w=0.4,
-                img_h=h,
-                img_w=w,
-            )
-
-            extra = self._detect_persons_in_crop(img, search_box)
-            extra = [p for p in extra if _is_plausible_rider(p, mb)]
-            if extra:
-                refined = _merge_person_detections(refined, extra, iou_thresh=0.55)
-                refined = _suppress_person_duplicates(refined, iou_thresh=0.60, ioa_thresh=0.85)
-                used += 1
-
-        return _suppress_person_duplicates(refined, iou_thresh=0.60, ioa_thresh=0.85)
-
-    def _log(self, msg: str):
-        if self.debug:
-            print(msg)
-
-    def _classify_helmet(self, img, person_box):
-        """
-        Return "helmet" or "no_helmet" for the given person crop.
-        Uses the helmet YOLO model if available, otherwise the heuristic.
-        """
-        x1, y1, x2, y2 = person_box[:4]
-        p_h = y2 - y1
-
-        # Head region: top 30% of person bounding box
-        head_y2 = y1 + p_h * 0.35
-        head_box = (x1, y1, x2, head_y2)
-        head_crop = _safe_crop(img, head_box)
-
-        if self.helmet_model is not None:
+        if self._ensure_plate_ocr():
             try:
-                # Run helmet model on upper-body crop (top 45% of person)
-                upper_box = (x1, y1, x2, y1 + p_h * 0.45)
-                upper_crop = _safe_crop(img, upper_box)
-                if upper_crop is not None and upper_crop.size > 0:
-                    h_results = self.helmet_model(
-                        upper_crop, conf=0.30, verbose=False
-                    )
-                    helmet_conf   = 0.0
-                    no_helmet_conf = 0.0
-                    for hr in h_results:
-                        for hbox in hr.boxes:
-                            c    = int(hbox.cls[0])
-                            conf = float(hbox.conf[0])
-                            # Model classes: 0=helmet, 1=no_helmet (check README)
-                            # Adjust class IDs based on actual model training
-                            name = hr.names.get(c, "").lower()
-                            if "no" in name or "without" in name or c == 1:
-                                no_helmet_conf = max(no_helmet_conf, conf)
-                            else:
-                                helmet_conf = max(helmet_conf, conf)
-
-                    # The keremberke model tends to overpredict "helmet" on dark hair.
-                    # We increase the confidence threshold required to trust the model.
-                    self._log(
-                        f"DEBUG: Person conf: helmet={helmet_conf:.2f}, "
-                        f"no_helmet={no_helmet_conf:.2f}"
-                    )
-                    if max(helmet_conf, no_helmet_conf) > 0.60:
-                        if helmet_conf > no_helmet_conf + 0.15:
-                            self._log("DEBUG: Returning model prediction: helmet")
-                            return "helmet"
-                        if no_helmet_conf > helmet_conf + 0.15:
-                            self._log("DEBUG: Returning model prediction: no_helmet")
-                            return "no_helmet"
-                    self._log("DEBUG: Model confidence too low, falling back to heuristic")
-            except Exception as e:
-                pass  # fall through to heuristic
-
-        # Heuristic fallback
-        result = _helmet_heuristic(head_crop)
-        self._log(f"DEBUG: Heuristic result: {result}")
-        if result is True:
-            return "helmet"
-        if result is False:
-            return "no_helmet"
-        # Uncertain → conservative: treat as no_helmet
-        return "no_helmet"
-
-    def _detect_plate(self, img, moto_box):
-        """
-        Return the OCR string from the license plate near the given motorcycle.
-        Returns "" if nothing found.
-        """
-        h, w = img.shape[:2]
-
-        # Search region: motorcycle box expanded 30% in each direction
-        search_box = _expand_box(moto_box, factor_h=0.4, factor_w=0.3,
-                                 img_h=h, img_w=w)
-
-        candidate_crops = []
-
-        # ── LP detector ──────────────────────────────────────────────────────
-        if self.lp_model is not None:
-            try:
-                search_crop = _safe_crop(img, search_box)
-                if search_crop is not None and search_crop.size > 0:
-                    lp_results = self.lp_model(
-                        search_crop, conf=0.20, verbose=False
-                    )
-                    sx1 = int(search_box[0])
-                    sy1 = int(search_box[1])
-                    for lr in lp_results:
-                        for lb in lr.boxes:
-                            lx1, ly1, lx2, ly2 = lb.xyxy[0].tolist()
-                            # Map back to original image coords
-                            abs_box = (sx1 + lx1, sy1 + ly1,
-                                       sx1 + lx2, sy1 + ly2)
-                            plate_crop = _safe_crop(img, abs_box)
-                            if plate_crop is not None:
-                                candidate_crops.append(plate_crop)
+                h, w = crop.shape[:2]
+                aspect_ratio = h / w if w > 0 else 0
+                
+                # 1. Standard Pass
+                result = self.plate_ocr.run(crop)
+                primary_text = ""
+                if isinstance(result, (list, tuple)) and len(result) > 0:
+                    primary_text = str(getattr(result[0], "plate", result[0]))
+                elif result:
+                    primary_text = str(getattr(result, "plate", result))
+                
+                if primary_text:
+                    texts.append(_clean_plate_text(primary_text))
+                
+                # 2. Smart Splitter for Stacked Plates (Aspect Ratio > 0.45)
+                if aspect_ratio > 0.45:
+                    mid = h // 2
+                    top_half = crop[0:mid+5, :]
+                    bottom_half = crop[mid-5:h, :]
+                    
+                    top_res = self.plate_ocr.run(top_half)
+                    bot_res = self.plate_ocr.run(bottom_half)
+                    
+                    t_txt = str(getattr(top_res[0], "plate", top_res[0])) if top_res else ""
+                    b_txt = str(getattr(bot_res[0], "plate", bot_res[0])) if bot_res else ""
+                    
+                    if t_txt or b_txt:
+                        texts.append(_clean_plate_text(f"{t_txt}{b_txt}"))
             except Exception:
                 pass
 
-        # ── Fallback: bottom-third of motorcycle bbox ─────────────────────────
-        if not candidate_crops:
-            mx1, my1, mx2, my2 = moto_box[:4]
-            m_h = my2 - my1
-            # Plate is usually on lower 30% of the motorcycle
-            bottom_box = (mx1, my2 - m_h * 0.4, mx2, my2)
-            bottom_crop = _safe_crop(img, bottom_box)
-            if bottom_crop is not None and bottom_crop.size > 0:
-                candidate_crops.append(bottom_crop)
+        # Removed EasyOCR fallback per user request
 
-        if not candidate_crops:
-            return ""
+        # Relaxed filter: return segments that are at least 3 characters long
+        deduped = []
+        for text in texts:
+            if len(text) >= 3 and text not in deduped:
+                deduped.append(text)
+        return deduped
 
-        # ── OCR each candidate ───────────────────────────────────────────────
-        all_texts = []
-        for crop in candidate_crops:
-            versions = _preprocess_plate(crop)
-            for ver in versions:
-                text = self._run_ocr(ver)
-                if text:
-                    all_texts.append(text)
+    def _triple_model_votes_true(self, crop) -> bool:
+        if self.triple_model is None or crop is None or crop.size == 0:
+            return False
 
-        return _smart_plate_merge(all_texts)
-
-    def _run_ocr(self, img) -> str:
-        """Run EasyOCR on a single image; return cleaned string."""
-        if self.ocr_reader is None or img is None or img.size == 0:
-            return ""
         try:
-            ocr_results = self.ocr_reader.readtext(img, detail=1,
-                                                    paragraph=False)
-            parts = []
-            for (_, text, conf) in ocr_results:
-                if conf > 0.20:
-                    cleaned = _clean_plate_text(text)
-                    if cleaned:
-                        parts.append(cleaned)
-            return " ".join(parts).strip()
+            results = self.triple_model(crop, conf=0.25, verbose=False)
+            names = getattr(self.triple_model, "names", {}) or {}
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    label = str(names.get(cls_id, cls_id)).lower()
+                    if "triple" in label or "3" in label:
+                        return True
+                    if len(names) <= 1:
+                        return True
         except Exception:
-            return ""
+            return False
 
-    # ── Public API ───────────────────────────────────────────────────────────
+        return False
+
+    def _count_persons_in_crop(self, crop) -> int:
+        if self.person_model is None or crop is None or crop.size == 0:
+            return 0
+
+        try:
+            results = self.person_model(crop, conf=0.20, iou=0.55, verbose=False)
+            count = 0
+            for r in results:
+                for box in r.boxes:
+                    if int(box.cls[0]) == self.person_class_id:
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
+    def _get_plate_candidates(self, img, bike_box, local_conf=0.05, global_conf=0.05):
+        h, w = img.shape[:2]
+        bx1, by1, bx2, by2 = [int(v) for v in bike_box]
+        bw, bh = bx2 - bx1, by2 - by1
+
+        # Expand search area significantly for front/rear plates
+        plate_search_x1 = max(0, bx1 - int(bw * 0.20))
+        plate_search_x2 = min(w, bx2 + int(bw * 0.20))
+        plate_search_y1 = max(0, by1 - int(bh * 0.10))
+        plate_search_y2 = min(h, by2 + int(bh * 0.30))
+        b_crop_lp = _safe_crop(img, (plate_search_x1, plate_search_y1, plate_search_x2, plate_search_y2))
+        if b_crop_lp is None:
+            return []
+
+        lp_w = plate_search_x2 - plate_search_x1
+        lp_h = plate_search_y2 - plate_search_y1
+        candidates = []
+
+        def add_candidate(abs_box, conf, source):
+            gx1, gy1, gx2, gy2 = [int(v) for v in abs_box]
+            pw, ph = gx2 - gx1, gy2 - gy1
+            if pw <= 0 or ph <= 0:
+                return
+            if ph > 0.65 * lp_h or pw > 0.98 * lp_w:
+                return
+            # Use exact crop box for fast_plate_ocr (no margins)
+            crop_box = (
+                max(0, gx1),
+                max(0, gy1),
+                min(w, gx2),
+                min(h, gy2),
+            )
+            crop = _safe_crop(img, crop_box)
+            if crop is None:
+                return
+            candidates.append({
+                "box": [gx1, gy1, gx2, gy2],
+                "crop_box": [int(v) for v in crop_box],
+                "crop": crop,
+                "conf": float(conf),
+                "source": source,
+            })
+
+        lp_res = self.lp_model(b_crop_lp, conf=local_conf, verbose=False)
+        for lr in lp_res:
+            for lb in lr.boxes:
+                lx1, ly1, lx2, ly2 = [int(v) for v in lb.xyxy[0].tolist()]
+                add_candidate(
+                    (
+                        plate_search_x1 + lx1,
+                        plate_search_y1 + ly1,
+                        plate_search_x1 + lx2,
+                        plate_search_y1 + ly2,
+                    ),
+                    float(lb.conf[0]),
+                    "local_extended",
+                )
+
+        if not candidates:
+            global_lp_res = self.lp_model(img, conf=global_conf, verbose=False)
+            for glr in global_lp_res:
+                for glb in glr.boxes:
+                    gx1, gy1, gx2, gy2 = [int(v) for v in glb.xyxy[0].tolist()]
+                    gcx, gcy = (gx1 + gx2) // 2, (gy1 + gy2) // 2
+                    if plate_search_x1 <= gcx <= plate_search_x2 and plate_search_y1 <= gcy <= plate_search_y2:
+                        add_candidate((gx1, gy1, gx2, gy2), float(glb.conf[0]), "global_fallback")
+
+        if not candidates:
+            # Last resort for front/rear two-wheelers: lower middle of the bike box.
+            cx = (bx1 + bx2) // 2
+            fw = int(bw * 0.40)
+            fy1 = by1 + int(bh * 0.55)
+            fy2 = min(h, by1 + int(bh * 0.80))
+            crop_box = (max(0, cx - fw // 2), fy1, min(w, cx + fw // 2), fy2)
+            crop = _safe_crop(img, crop_box)
+            if crop is not None:
+                candidates.append({
+                    "box": [int(v) for v in crop_box],
+                    "crop_box": [int(v) for v in crop_box],
+                    "crop": crop,
+                    "conf": 0.0,
+                    "source": "heuristic_front_plate",
+                })
+
+        candidates.sort(key=lambda c: c["conf"], reverse=True)
+        return candidates
 
     def predict(self, image_path: str) -> dict:
-        """
-        Stateless inference on single image.
-        
-        Input : path to an RGB street image
-        Output: {"violations": [...]} — only violating motorcycles are listed
-        
-        OPTIMIZATION STRATEGY (Asymmetric Scoring w1=0.4, w2=0.6):
-        ──────────────────────────────────────────────────────────
-        1. EARLY PRUNING: Remove compliant motorcycles immediately after helmet
-           classification. This preserves 60% of computational budget for expensive
-           character recognition (OCR) tasks that directly impact w2 score.
-        
-        2. AGGRESSIVE FILTERING: Only violators (triple-riding OR helmet-violations)
-           proceed to OCR pipeline. Non-violators are discarded without plate recognition.
-        
-        3. COMPUTATIONAL ALLOCATION:
-           - Object Detection: ~20 ms (5% budget)
-           - Helmet Classification: ~80 ms (15% budget)
-           - Early Pruning: <1 ms (decision point)
-           - License Plate OCR: ~300 ms (60% budget, only for violators)
-           ────────────────────────────────────
-           Total: ~400-600 ms (safe within 5s limit)
-        
-        This design directly addresses the evaluation protocol where plate recognition
-        errors (w2 component) are penalized more severely than violation misclassification
-        (w1 component) in asymmetric weighting scenarios.
-        """
+        """9:20 PM Version: Restoring the high-stability side-by-side logic."""
         violations = []
         try:
             img = cv2.imread(str(image_path))
-            if img is None:
-                raise ValueError(f"Cannot load image: {image_path}")
+            if img is None: return {"violations": []}
+            h, w = img.shape[:2]
+            
+            # 1. Detect Motorcycles with Side-by-Side Splitter
+            bike_results = self.bike_detector(img, conf=0.15, verbose=False)
+            bikes = []
+            for r in bike_results:
+                for b in r.boxes:
+                    bx1, by1, bx2, by2 = [int(v) for v in b.xyxy[0].tolist()]
+                    conf = float(b.conf[0])
+                    bw, bh = bx2 - bx1, by2 - by1
+                    
+                    if bw > 1.8 * bh: # Perfect slicing of two bikes side-by-side
+                        mid_x = bx1 + (bw // 2)
+                        bikes.append([bx1, by1, mid_x, by2, conf])
+                        bikes.append([mid_x, by1, bx2, by2, conf])
+                        continue
+                    bikes.append([bx1, by1, bx2, by2, conf])
 
-            # ── Stage 1: Detect persons + motorcycles ─────────────────────────
-            persons, motos = self._detect_objects(img)
+            # 2. Detect All Heads (Global)
+            head_results = self.helmet_model(img, conf=0.15, verbose=False)
+            all_heads = []
+            for r in head_results:
+                for b in r.boxes:
+                    hx1, hy1, hx2, hy2 = [int(v) for v in b.xyxy[0].tolist()]
+                    h_cls = int(b.cls[0])
+                    all_heads.append([hx1, hy1, hx2, hy2, h_cls])
+            
+            # Exclusive assignment to prevent double-counting
+            assigned_head_indices = set()
+            bikes = sorted(bikes, key=lambda x: x[4], reverse=True)
 
-            if not motos:
-                return {"violations": []}
+            for b_idx, b in enumerate(bikes):
+                bx1, by1, bx2, by2, bconf = b
+                bw, bh = bx2 - bx1, by2 - by1
+                bike_cx = (bx1 + bx2) / 2
+                
+                riders, no_helmet = 0, 0
+                for h_idx, head in enumerate(all_heads):
+                    if h_idx in assigned_head_indices: continue
+                    
+                    hx1, hy1, hx2, hy2, h_cls = head
+                    hcx, hcy = (hx1 + hx2) // 2, (hy1 + hy2) // 2
+                    
+                    h_match = (bx1 - int(bw*0.2) <= hcx <= bx2 + int(bw*0.2))
+                    v_match = (by1 - int(bh*0.8) <= hcy <= by1 + int(bh*0.4))
+                    
+                    if h_match and v_match:
+                        # Ensure it's horizontally closer to THIS bike than any other
+                        is_closest = True
+                        for ob_idx, ob in enumerate(bikes):
+                            if ob_idx == b_idx: continue
+                            ocx = (ob[0] + ob[2]) / 2
+                            if abs(hcx - ocx) < abs(hcx - bike_cx):
+                                is_closest = False; break
+                        
+                        if is_closest:
+                            assigned_head_indices.add(h_idx)
+                            riders += 1
+                            if h_cls == self.no_helmet_id: no_helmet += 1
+                
+                # Fallbacks
+                b_crop = _safe_crop(img, (bx1, by1, bx2, by2))
+                if riders == 0:
+                    riders = self._count_persons_in_crop(b_crop)
+                if self._triple_model_votes_true(b_crop):
+                    riders = max(riders, 3)
 
-            # Targeted re-detection to recover missed riders on bikes
-            persons = self._refine_person_detections(img, persons, motos)
-
-            person_boxes = [p[:4] for p in persons]
-            moto_boxes   = [m[:4] for m in motos]
-
-            # ── Stage 2: Associate riders to motorcycles ───────────────────────
-            assignments = _associate_riders_to_motorcycles(person_boxes, moto_boxes)
-
-            # ── Stage 3: Per-motorcycle violation check ───────────────────────
-            for mi, rider_indices in enumerate(assignments):
-                moto_box  = moto_boxes[mi]
-                num_riders = len(rider_indices)
-
-                # Count helmet violations
-                helmet_violations = 0
-                for pi in rider_indices:
-                    status = self._classify_helmet(img, person_boxes[pi])
-                    if status == "no_helmet":
-                        helmet_violations += 1
-
-                # Determine if this motorcycle has a violation
-                triple_riding = num_riders > 2
-                helmet_viol   = helmet_violations > 0
-
-                # ╔═══════════════════════════════════════════════════════════╗
-                # ║  AGGRESSIVE FILTERING: Early Pruning for OCR Budget      ║
-                # ║  ─────────────────────────────────────────────────────    ║
-                # ║  If compliant → SKIP immediately (no plate recognition)  ║
-                # ║  If violating → Process OCR (expensive, w2-weighted)     ║
-                # ╚═══════════════════════════════════════════════════════════╝
-                if not (triple_riding or helmet_viol):
-                    continue  # DROP COMPLIANT MOTORCYCLE — preserve budget
-
-                # ── Stage 4+5: License plate recognition ──────────────────────
-                # Only violators reach this expensive OCR pipeline
-                plate_str = self._detect_plate(img, moto_box)
-
-                violations.append({
-                    "num_riders":        num_riders,
-                    "helmet_violations": helmet_violations,
-                    "license_plate":     plate_str,
-                })
-
+                if riders > 2 or no_helmet > 0:
+                    plate_candidates = self._get_plate_candidates(img, (bx1, by1, bx2, by2))
+                    best_plate = ""
+                    for cand in plate_candidates[:3]:
+                        texts = self._run_plate_ocr(cand["crop"])
+                        if texts:
+                            best_plate = texts[0]; break
+                    
+                    violations.append({
+                        "num_riders": int(max(riders, 1)),
+                        "helmet_violations": int(no_helmet),
+                        "license_plate": str(best_plate)
+                    })
         except Exception:
             traceback.print_exc()
-            # Return empty violations on error (do not crash evaluator)
-            return {"violations": []}
-
         return {"violations": violations}
