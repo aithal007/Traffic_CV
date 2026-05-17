@@ -292,8 +292,10 @@ class TrafficViolationDetector:
             helmet_path = self.model_dir / "helmet_best.pt"
         self.helmet_model = YOLO(str(helmet_path))
         
-        # Priority: license_best.pt > lp_detector.pt
-        lp_path = self.model_dir / "license_best.pt"
+        # Priority: lp_best_last.pt > license_best.pt > lp_detector.pt
+        lp_path = self.model_dir / "lp_best_last.pt"
+        if not lp_path.exists():
+            lp_path = self.model_dir / "license_best.pt"
         if not lp_path.exists():
             lp_path = self.model_dir / "lp_detector.pt"
         self.lp_model = YOLO(str(lp_path))
@@ -446,7 +448,7 @@ class TrafficViolationDetector:
         except Exception:
             return 0
 
-    def _get_plate_candidates(self, img, bike_box, local_conf=0.05, global_conf=0.05):
+    def _get_plate_candidates(self, img, bike_box, local_conf=0.15, global_conf=0.15):
         h, w = img.shape[:2]
         bx1, by1, bx2, by2 = [int(v) for v in bike_box]
         bw, bh = bx2 - bx1, by2 - by1
@@ -504,14 +506,14 @@ class TrafficViolationDetector:
                     "local_extended",
                 )
 
-        if not candidates:
-            global_lp_res = self.lp_model(img, conf=global_conf, verbose=False)
-            for glr in global_lp_res:
-                for glb in glr.boxes:
-                    gx1, gy1, gx2, gy2 = [int(v) for v in glb.xyxy[0].tolist()]
-                    gcx, gcy = (gx1 + gx2) // 2, (gy1 + gy2) // 2
-                    if plate_search_x1 <= gcx <= plate_search_x2 and plate_search_y1 <= gcy <= plate_search_y2:
-                        add_candidate((gx1, gy1, gx2, gy2), float(glb.conf[0]), "global_fallback")
+        # Always run global scan in addition to local scan for maximum robustness
+        global_lp_res = self.lp_model(img, conf=global_conf, verbose=False)
+        for glr in global_lp_res:
+            for glb in glr.boxes:
+                gx1, gy1, gx2, gy2 = [int(v) for v in glb.xyxy[0].tolist()]
+                gcx, gcy = (gx1 + gx2) // 2, (gy1 + gy2) // 2
+                if plate_search_x1 <= gcx <= plate_search_x2 and plate_search_y1 <= gcy <= plate_search_y2:
+                    add_candidate((gx1, gy1, gx2, gy2), float(glb.conf[0]), "global_fallback")
 
         if not candidates:
             # Last resort for front/rear two-wheelers: lower middle of the bike box.
