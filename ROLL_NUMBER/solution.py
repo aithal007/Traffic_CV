@@ -86,7 +86,7 @@ def _get_exclusive_trapezium(bike_box, all_bikes, img_width, img_height):
             mid = (ox2 + bx1) // 2
             left_bound = max(left_bound, mid)
             
-    top_y = max(0, by1 - int(bh * 0.5))
+    top_y = max(0, by1 - int(bh * 1.5))
     bot_y = by1 + int(bh * 0.45)
     
     pts = np.array([
@@ -543,8 +543,8 @@ class TrafficViolationDetector:
             h, w = img.shape[:2]
 
             # 1. Detect Bikes (Rely on YOLO's internal NMS)
-            # Using 0.15 to avoid detecting background cars/autos as motorcycles
-            res = self.bike_detector(img, conf=0.35, iou=0.45, verbose=False)
+            # Using 0.20 to capture lower confidence bikes
+            res = self.bike_detector(img, conf=0.20, iou=0.45, verbose=False)
             bikes = []
             for r in res:
                 for b in r.boxes:
@@ -570,7 +570,7 @@ class TrafficViolationDetector:
             # 1. PRE-DETECT ALL HEADS IN THE IMAGE (to allow unique assignment)
             all_heads_global = []
             raw_global_heads = []
-            h_full_res = self.helmet_model(img, conf=0.20, verbose=False)
+            h_full_res = self.helmet_model(img, conf=0.18, verbose=False)
             for hr in h_full_res:
                 for hb in hr.boxes:
                     hx1, hy1, hx2, hy2 = [int(v) for v in hb.xyxy[0].tolist()]
@@ -605,7 +605,7 @@ class TrafficViolationDetector:
                     in_trap = _point_in_polygon((h_cx, h_cy), trapezium)
                     
                     # Or just horizontally within the bike's bounds if it's vertically close to the top
-                    v_close = (by1 - int(bh*0.5) <= h_cy <= by1 + int(bh*0.40))
+                    v_close = (by1 - int(bh*1.5) <= h_cy <= by1 + int(bh*0.40))
                     h_overlap = (bx1 - int(bw*0.1) <= h_cx <= bx2 + int(bw*0.1))
 
                     if in_trap or (v_close and h_overlap):
