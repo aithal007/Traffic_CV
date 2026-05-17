@@ -97,7 +97,7 @@ def test_and_visualize(img_path, out_path):
     print(f"Visual proof saved to {out_path}!")
 
 if __name__ == "__main__":
-    target = "image.jpeg" if Path("image.jpeg").exists() else "image.png"
+    target = "image.png"
     if Path(target).exists():
         test_and_visualize(target, "annotated_trapezium.jpg")
     else:

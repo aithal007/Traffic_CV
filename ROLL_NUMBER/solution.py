@@ -128,16 +128,6 @@ def _clean_plate_text(raw: str) -> str:
     text = re.sub(r"[^A-Z0-9 \-]", "", raw.upper().strip())
     return re.sub(r"\s+", " ", text)
 
-def _smart_plate_merge(texts: list[str]) -> str:
-    """Selects the best license plate candidate from a list of OCR results."""
-    if not texts: return ""
-    # Prioritize strings that look like Indian plates (e.g., 2 letters + 2 digits)
-    valid_plates = [t for t in texts if re.match(r"^[A-Z]{2}\d{2}", t)]
-    if valid_plates:
-        return max(valid_plates, key=len)
-    # Otherwise just return the longest string
-    return max(texts, key=len)
-
 def _letterize_plate_prefix(text: str) -> str:
     table = str.maketrans({
         "0": "O",
@@ -298,7 +288,10 @@ class TrafficViolationDetector:
 
     def _load_models(self):
         YOLO = _get_yolo()
-        self.bike_detector = YOLO(str(self.model_dir / "bike_best.pt"))
+        bike_path = self.model_dir / "last_bike_best.pt"
+        if not bike_path.exists():
+            bike_path = self.model_dir / "bike_best.pt"
+        self.bike_detector = YOLO(str(bike_path))
         self.helmet_model = YOLO(str(self.model_dir / "helmet_best.pt"))
         
         # Priority: license_best.pt > lp_detector.pt
@@ -337,23 +330,10 @@ class TrafficViolationDetector:
         self._plate_ocr_attempted = True
         try:
             from fast_plate_ocr import LicensePlateRecognizer
-            # Swapping to the 's-v2' model which showed 89% confidence on JK plates
             self.plate_ocr = LicensePlateRecognizer("cct-s-v2-global-model", device="cpu")
         except Exception:
             self.plate_ocr = None
         return self.plate_ocr is not None
-
-    def _ensure_easyocr(self):
-        if self.ocr_reader is not None:
-            return True
-        try:
-            import easyocr
-            storage = str(self.model_dir / "easyocr")
-            os.makedirs(storage, exist_ok=True)
-            self.ocr_reader = easyocr.Reader(["en"], model_storage_directory=storage, gpu=False, verbose=False, download_enabled=False)
-        except Exception:
-            self.ocr_reader = None
-        return self.ocr_reader is not None
 
     def _run_plate_ocr(self, crop) -> list[str]:
         texts = []
@@ -392,8 +372,6 @@ class TrafficViolationDetector:
                         texts.append(_clean_plate_text(f"{t_txt}{b_txt}"))
             except Exception:
                 pass
-
-        # Removed EasyOCR fallback per user request
 
         # Relaxed filter: return segments that are at least 3 characters long
         deduped = []
@@ -525,91 +503,121 @@ class TrafficViolationDetector:
         return candidates
 
     def predict(self, image_path: str) -> dict:
-        """9:20 PM Version: Restoring the high-stability side-by-side logic."""
         violations = []
         try:
             img = cv2.imread(str(image_path))
             if img is None: return {"violations": []}
             h, w = img.shape[:2]
-            
-            # 1. Detect Motorcycles with Side-by-Side Splitter
-            bike_results = self.bike_detector(img, conf=0.15, verbose=False)
+
+            # 1. Detect Bikes (Rely on YOLO's internal NMS)
+            # Using 0.15 to avoid detecting background cars/autos as motorcycles
+            res = self.bike_detector(img, conf=0.35, iou=0.45, verbose=False)
             bikes = []
-            for r in bike_results:
+            for r in res:
                 for b in r.boxes:
                     bx1, by1, bx2, by2 = [int(v) for v in b.xyxy[0].tolist()]
                     conf = float(b.conf[0])
-                    bw, bh = bx2 - bx1, by2 - by1
                     
-                    if bw > 1.8 * bh: # Perfect slicing of two bikes side-by-side
+                    bw = bx2 - bx1
+                    bh = by2 - by1
+
+                    # Only split horizontally (side-by-side) if extremely wide
+                    if bw > 1.8 * bh:
                         mid_x = bx1 + (bw // 2)
                         bikes.append([bx1, by1, mid_x, by2, conf])
                         bikes.append([mid_x, by1, bx2, by2, conf])
                         continue
+
+                    # SCALE GUARD: Reject impossibly large bikes (likely background/officers)
+                    if bw > 0.99 * w and bh > 0.99 * h:
+                        continue
+                        
                     bikes.append([bx1, by1, bx2, by2, conf])
 
-            # 2. Detect All Heads (Global)
-            head_results = self.helmet_model(img, conf=0.15, verbose=False)
-            all_heads = []
-            for r in head_results:
-                for b in r.boxes:
-                    hx1, hy1, hx2, hy2 = [int(v) for v in b.xyxy[0].tolist()]
-                    h_cls = int(b.cls[0])
-                    all_heads.append([hx1, hy1, hx2, hy2, h_cls])
+            # 1. PRE-DETECT ALL HEADS IN THE IMAGE (to allow unique assignment)
+            all_heads_global = []
+            raw_global_heads = []
+            h_full_res = self.helmet_model(img, conf=0.20, verbose=False)
+            for hr in h_full_res:
+                for hb in hr.boxes:
+                    hx1, hy1, hx2, hy2 = [int(v) for v in hb.xyxy[0].tolist()]
+                    raw_global_heads.append([hx1, hy1, hx2, hy2, float(hb.conf[0]), int(hb.cls[0])])
+            all_heads_global = _suppress_duplicates(raw_global_heads, iou_thresh=0.20)
             
-            # Exclusive assignment to prevent double-counting
+            # Keep track of which heads are already assigned
             assigned_head_indices = set()
+
+            # 2. PROCESS BIKES BY CONFIDENCE (Greedy assignment)
             bikes = sorted(bikes, key=lambda x: x[4], reverse=True)
 
             for b_idx, b in enumerate(bikes):
                 bx1, by1, bx2, by2, bconf = b
-                bw, bh = bx2 - bx1, by2 - by1
+                bh, bw = by2 - by1, bx2 - bx1
+
+
+                num_riders, no_helmet_count = 0, 0
                 bike_cx = (bx1 + bx2) / 2
                 
-                riders, no_helmet = 0, 0
-                for h_idx, head in enumerate(all_heads):
+                # Get exclusive ROI constrained by nearby bikes
+                trapezium = _get_exclusive_trapezium((bx1, by1, bx2, by2), bikes, w, h)
+                
+                # 2a. Proximity Association: Head belongs to the bike it is horizontally closest to
+                for h_idx, hd in enumerate(all_heads_global):
                     if h_idx in assigned_head_indices: continue
                     
-                    hx1, hy1, hx2, hy2, h_cls = head
-                    hcx, hcy = (hx1 + hx2) // 2, (hy1 + hy2) // 2
+                    hx1, hy1, hx2, hy2, h_conf, h_cls = hd
+                    h_cx, h_cy = (hx1 + hx2) // 2, (hy1 + hy2) // 2
                     
-                    h_match = (bx1 - int(bw*0.2) <= hcx <= bx2 + int(bw*0.2))
-                    v_match = (by1 - int(bh*0.8) <= hcy <= by1 + int(bh*0.4))
+                    # Must be within a reasonable vertical range (trapezium range)
+                    in_trap = _point_in_polygon((h_cx, h_cy), trapezium)
                     
-                    if h_match and v_match:
-                        # Ensure it's horizontally closer to THIS bike than any other
+                    # Or just horizontally within the bike's bounds if it's vertically close to the top
+                    v_close = (by1 - int(bh*0.5) <= h_cy <= by1 + int(bh*0.40))
+                    h_overlap = (bx1 - int(bw*0.1) <= h_cx <= bx2 + int(bw*0.1))
+
+                    if in_trap or (v_close and h_overlap):
+                        # But it MUST be closer to this bike center than any other
                         is_closest = True
                         for ob_idx, ob in enumerate(bikes):
                             if ob_idx == b_idx: continue
-                            ocx = (ob[0] + ob[2]) / 2
-                            if abs(hcx - ocx) < abs(hcx - bike_cx):
-                                is_closest = False; break
+                            other_cx = (ob[0] + ob[2]) / 2
+                            if abs(h_cx - other_cx) < abs(h_cx - bike_cx):
+                                is_closest = False
+                                break
                         
                         if is_closest:
                             assigned_head_indices.add(h_idx)
-                            riders += 1
-                            if h_cls == self.no_helmet_id: no_helmet += 1
-                
-                # Fallbacks
-                b_crop = _safe_crop(img, (bx1, by1, bx2, by2))
-                if riders == 0:
-                    riders = self._count_persons_in_crop(b_crop)
-                if self._triple_model_votes_true(b_crop):
-                    riders = max(riders, 3)
+                            num_riders += 1
+                            head_crop = _safe_crop(img, (hx1, hy1, hx2, hy2))
+                            heuristic = _helmet_heuristic(head_crop)
+                            is_nh = (h_cls == self.no_helmet_id) if h_conf > 0.30 else (heuristic is False)
+                            if is_nh: no_helmet_count += 1
 
-                if riders > 2 or no_helmet > 0:
-                    plate_candidates = self._get_plate_candidates(img, (bx1, by1, bx2, by2))
-                    best_plate = ""
-                    for cand in plate_candidates[:3]:
-                        texts = self._run_plate_ocr(cand["crop"])
-                        if texts:
-                            best_plate = texts[0]; break
-                    
-                    violations.append({
-                        "num_riders": int(max(riders, 1)),
-                        "helmet_violations": int(no_helmet),
-                        "license_plate": str(best_plate)
-                    })
-        except Exception:
-            traceback.print_exc()
+                b_crop = _safe_crop(img, (bx1, by1, bx2, by2))
+                
+                # 3. Aux Fallbacks (Person Counting & Triple Model)
+                if num_riders == 0:
+                    num_riders = self._count_persons_in_crop(b_crop)
+                
+                if self._triple_model_votes_true(b_crop):
+                    num_riders = max(num_riders, 3)
+
+                # Skip if no violation detected
+                if num_riders <= 2 and no_helmet_count == 0:
+                    continue
+
+                # 4. Plate Detection & OCR
+                plate_candidates = self._get_plate_candidates(img, (bx1, by1, bx2, by2))
+                all_texts = []
+                for candidate in plate_candidates[:3]:
+                    all_texts.extend(self._run_plate_ocr(candidate["crop"]))
+                
+                # Final Violation Assembly
+                final_riders = min(num_riders, 3)
+                violations.append({
+                    "num_riders": final_riders,
+                    "helmet_violations": no_helmet_count,
+                    "license_plate": _smart_plate_merge(all_texts)
+                })
+        except Exception: traceback.print_exc()
         return {"violations": violations}
