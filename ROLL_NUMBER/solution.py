@@ -231,18 +231,11 @@ def _smart_plate_merge(candidates: list[str]) -> str:
     if not candidates: return ""
     
     # Standard Indian Plate Regex (e.g. TN 02 AV 6447, CH 01 AB 2896)
-    # Allows for state (2 letters), city code (2 digits), series (up to 2 letters), and number (4 digits)
-    pat = re.compile(r"^[A-Z]{2}\s?\d{2}\s?[A-Z]{0,3}\s?\d{4}$")
+    # Allows for state (2 letters), city code (2 digits), series (up to 3 letters), and number (3 to 4 digits)
+    pat = re.compile(r"^[A-Z]{2}\s?\d{2}\s?[A-Z]{0,3}\s?\d{3,4}$")
     
-    # Normalize candidates (remove spaces/dashes)
-    expanded_candidates = list(candidates)
-    for i, left in enumerate(candidates):
-        for j, right in enumerate(candidates):
-            if i != j:
-                expanded_candidates.append(f"{left} {right}")
-
     cands = []
-    for c in expanded_candidates:
+    for c in candidates:
         for norm in _normalize_indian_plate_candidate(c):
             if len(norm) >= 2:
                 cands.append(norm)
@@ -260,7 +253,8 @@ def _smart_plate_merge(candidates: list[str]) -> str:
         }
         known_state = [c for c in valid if c[:2] in state_codes]
         pool = known_state or valid
-        return sorted(pool, key=lambda c: (c[:2] != "KA", -len(c), c))[0]
+        # Unbiased sorting by descending length (longest is most complete) and content
+        return sorted(pool, key=lambda c: (-len(c), c))[0]
             
     # 2. Try to find a partial match (e.g. state code + 4 digits)
     for c in cands:
@@ -292,7 +286,11 @@ class TrafficViolationDetector:
         if not bike_path.exists():
             bike_path = self.model_dir / "bike_best.pt"
         self.bike_detector = YOLO(str(bike_path))
-        self.helmet_model = YOLO(str(self.model_dir / "helmet_best.pt"))
+        
+        helmet_path = self.model_dir / "helmet_best_last.pt"
+        if not helmet_path.exists():
+            helmet_path = self.model_dir / "helmet_best.pt"
+        self.helmet_model = YOLO(str(helmet_path))
         
         # Priority: license_best.pt > lp_detector.pt
         lp_path = self.model_dir / "license_best.pt"
@@ -345,31 +343,64 @@ class TrafficViolationDetector:
                 h, w = crop.shape[:2]
                 aspect_ratio = h / w if w > 0 else 0
                 
-                # 1. Standard Pass
-                result = self.plate_ocr.run(crop)
-                primary_text = ""
-                if isinstance(result, (list, tuple)) and len(result) > 0:
-                    primary_text = str(getattr(result[0], "plate", result[0]))
-                elif result:
-                    primary_text = str(getattr(result, "plate", result))
+                # 1. Upscale tiny crops to guarantee clear Transformer attention
+                if h < 64 or w < 200:
+                    scale = max(64.0 / h, 200.0 / w)
+                    crop_for_preproc = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+                else:
+                    crop_for_preproc = crop
                 
-                if primary_text:
-                    texts.append(_clean_plate_text(primary_text))
+                # 2. Generate 6 Pre-processing variants
+                gray = cv2.cvtColor(crop_for_preproc, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
+                sharpened = np.clip(cv2.filter2D(clahe, -1, np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])), 0, 255).astype(np.uint8)
+                _, binary = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+                morphed = cv2.erode(cv2.dilate(clahe, kernel), kernel)
                 
-                # 2. Smart Splitter for Stacked Plates (Aspect Ratio > 0.45)
+                variants = [
+                    crop,
+                    cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(morphed, cv2.COLOR_GRAY2BGR)
+                ]
+                
+                # Run OCR on all 6 variants of the crop
+                for var in variants:
+                    result = self.plate_ocr.run(var)
+                    primary_text = ""
+                    if isinstance(result, (list, tuple)) and len(result) > 0:
+                        primary_text = str(getattr(result[0], "plate", result[0]))
+                    elif result:
+                        primary_text = str(getattr(result, "plate", result))
+                    
+                    if primary_text:
+                        texts.append(_clean_plate_text(primary_text))
+                
+                # 3. Smart Splitter for Stacked Plates (Aspect Ratio > 0.45)
                 if aspect_ratio > 0.45:
                     mid = h // 2
                     top_half = crop[0:mid+5, :]
                     bottom_half = crop[mid-5:h, :]
                     
-                    top_res = self.plate_ocr.run(top_half)
-                    bot_res = self.plate_ocr.run(bottom_half)
-                    
-                    t_txt = str(getattr(top_res[0], "plate", top_res[0])) if top_res else ""
-                    b_txt = str(getattr(bot_res[0], "plate", bot_res[0])) if bot_res else ""
-                    
-                    if t_txt or b_txt:
-                        texts.append(_clean_plate_text(f"{t_txt}{b_txt}"))
+                    # Split raw, CLAHE, and Morphed crops
+                    for var in [crop, cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR), cv2.cvtColor(morphed, cv2.COLOR_GRAY2BGR)]:
+                        vh, vw = var.shape[:2]
+                        vmid = vh // 2
+                        v_top = var[0:vmid+5, :]
+                        v_bot = var[vmid-5:vh, :]
+                        
+                        top_res = self.plate_ocr.run(v_top)
+                        bot_res = self.plate_ocr.run(v_bot)
+                        
+                        t_txt = str(getattr(top_res[0], "plate", top_res[0])) if top_res else ""
+                        b_txt = str(getattr(bot_res[0], "plate", bot_res[0])) if bot_res else ""
+                        
+                        if t_txt or b_txt:
+                            texts.append(_clean_plate_text(f"{t_txt}{b_txt}"))
             except Exception:
                 pass
 
@@ -440,12 +471,12 @@ class TrafficViolationDetector:
                 return
             if ph > 0.65 * lp_h or pw > 0.98 * lp_w:
                 return
-            # Use exact crop box for fast_plate_ocr (no margins)
+            # Use exact crop box with small safety margins to prevent character cut-off
             crop_box = (
-                max(0, gx1),
-                max(0, gy1),
-                min(w, gx2),
-                min(h, gy2),
+                max(0, gx1 - 5),
+                max(0, gy1 - 5),
+                min(w, gx2 + 10),
+                min(h, gy2 + 5),
             )
             crop = _safe_crop(img, crop_box)
             if crop is None:

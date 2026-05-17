@@ -68,17 +68,24 @@ def test_and_visualize(img_path, out_path):
         trap_pts = _get_exclusive_trapezium((bx1, by1, bx2, by2), all_bikes_viz, w, h)
         cv2.polylines(img, [trap_pts], isClosed=True, color=(255, 255, 0), thickness=1)
 
-    # Draw Heads
-    head_res = detector.helmet_model(img, conf=0.15, verbose=False)
+    # Draw Heads with NMS Suppression (identical to production solution.py)
+    head_res = detector.helmet_model(img, conf=0.25, verbose=False)
+    raw_heads = []
     for r in head_res:
         for b in r.boxes:
             hx1, hy1, hx2, hy2 = [int(v) for v in b.xyxy[0].tolist()]
-            h_cls = int(b.cls[0])
-            color = (0, 0, 255) if h_cls == detector.no_helmet_id else (0, 255, 0)
-            label = "No Helmet" if h_cls == detector.no_helmet_id else "Helmet"
-            cv2.rectangle(img, (hx1, hy1), (hx2, hy2), color, 2)
-            cx, cy = (hx1 + hx2) // 2, (hy1 + hy2) // 2
-            cv2.circle(img, (cx, cy), 4, color, -1)
+            raw_heads.append([hx1, hy1, hx2, hy2, float(b.conf[0]), int(b.cls[0])])
+            
+    from solution import _suppress_duplicates
+    clean_heads = _suppress_duplicates(raw_heads, iou_thresh=0.20)
+    
+    for h_info in clean_heads:
+        hx1, hy1, hx2, hy2, h_conf, h_cls = h_info
+        color = (0, 0, 255) if h_cls == detector.no_helmet_id else (0, 255, 0)
+        label = "No Helmet" if h_cls == detector.no_helmet_id else "Helmet"
+        cv2.rectangle(img, (hx1, hy1), (hx2, hy2), color, 2)
+        cx, cy = (hx1 + hx2) // 2, (hy1 + hy2) // 2
+        cv2.circle(img, (cx, cy), 4, color, -1)
 
     # Global LP Detection Debug
     lp_res = detector.lp_model(img, conf=0.15, verbose=False)
