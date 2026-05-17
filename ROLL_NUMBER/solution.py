@@ -17,8 +17,10 @@ from typing import Any
 import cv2
 import numpy as np
 
-# Fix Windows OpenMP conflict
+# Fix Windows OpenMP conflict and PaddlePaddle MKLDNN / PIR executor bugs
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ.setdefault("YOLO_CONFIG_DIR", str(Path(__file__).resolve().parent))
 
 _ultralytics_yolo = None
@@ -123,10 +125,76 @@ def _helmet_heuristic(head_crop):
 # OCR Preprocessing & Pattern Matching
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _clean_plate_text(raw: str) -> str:
-    if not raw: return ""
-    text = re.sub(r"[^A-Z0-9 \-]", "", raw.upper().strip())
-    return re.sub(r"\s+", " ", text)
+def _clean_plate(raw: str) -> str:
+    """Position-aware char correction for Indian plates (LL NN L(L)(L) NNNN)."""
+    if not raw:
+        return "UNKNOWN"
+    
+    text = re.sub(r"[^A-Z0-9]", "", raw.upper().strip())
+    text = text.replace("POLICE", "").replace("IND", "")
+    
+    L = r"[A-Z0683]"
+    N = r"[0-9OIQZASBGTC]"
+    
+    pattern = f"({L}{{2}})({N}{{2}})({L}{{1,3}})({N}{{4}})"
+    match = re.search(pattern, text)
+    if match:
+        state, dist, series, number = match.groups()
+        state = state.translate(str.maketrans("0683", "OGBJ"))
+        dist = dist.translate(str.maketrans("OIQZASBGTC", "0102458610"))
+        series = series.translate(str.maketrans("0683", "OGBJ"))
+        number = number.translate(str.maketrans("OIQZASBGTC", "0102458610"))
+        return state + dist + series + number
+    
+    if len(text) < 4:
+        return "UNKNOWN"
+    if len(text) >= 8:
+        state = text[0:2].translate(str.maketrans("0683", "OGBJ"))
+        dist = text[2:4].translate(str.maketrans("OIQZASBGTC", "0102458610"))
+        series = text[4:6].translate(str.maketrans("0683", "OGBJ"))
+        number = text[6:].translate(str.maketrans("OIQZASBGTC", "0102458610"))
+        text = state + dist + series + number
+    else:
+        text = re.sub(r"(?<=[0-9])[OQ](?=[0-9])", "0", text)
+    
+    text = re.sub(r"(.)\1{3,}", r"\1\1", text)
+    return text[:13] if len(text) >= 4 else "UNKNOWN"
+
+def _plate_quality(text: str) -> float:
+    """Score plate based on pattern matching."""
+    if not text or text == "UNKNOWN":
+        return 0.0
+    score = len(text) * 0.1
+    _INDIAN_PLATE_RE = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,3}[0-9]{4}$")
+    _INDIAN_STATE_CODES = {
+        "AP","AR","AS","BR","CG","GA","GJ","HR","HP","JH","KA","KL",
+        "MP","MH","MN","ML","MZ","NL","OD","PB","RJ","SK","TN","TS",
+        "TR","UP","UK","WB","AN","CH","DD","DL","JK","LA","LD","PY",
+    }
+    if _INDIAN_PLATE_RE.match(text):
+        score += 2.0
+    if len(text) >= 2 and text[:2] in _INDIAN_STATE_CODES:
+        score += 1.0
+    return score
+
+def _plate_variants(crop: np.ndarray) -> list:
+    """5 preprocessing variants for best OCR coverage."""
+    if crop is None or crop.size == 0:
+        return []
+    
+    scale = max(1.0, 300 / max(crop.shape[1], 1))
+    big = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
+    
+    def g2b(g): return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    
+    return [big, g2b(enhanced), g2b(otsu), g2b(cv2.bitwise_not(otsu)), g2b(adaptive)]
 
 def _letterize_plate_prefix(text: str) -> str:
     table = str.maketrans({
@@ -268,11 +336,147 @@ def _smart_plate_merge(candidates: list[str]) -> str:
     return max(cands_with_digits, key=len)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OCR Wrapper - Handles both old (<2.8) and new (>=2.8) PaddleOCR APIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _OCRWrapper:
+    """Handles both old (<2.8) and new (>=2.8) PaddleOCR APIs."""
+    
+    def __init__(self, model_dir: str):
+        from paddleocr import PaddleOCR
+        self._new_api = False
+        paddle_dir = self._find_paddle_model_dir(model_dir)
+        official_dir = os.path.join(paddle_dir, "official_models") if paddle_dir else ""
+
+        det_v5 = os.path.join(official_dir, "PP-OCRv5_server_det")
+        rec_v5 = os.path.join(official_dir, "en_PP-OCRv5_mobile_rec")
+        if not os.path.isdir(rec_v5):
+            rec_v5 = os.path.join(official_dir, "PP-OCRv5_mobile_rec")
+
+        new_kwargs = dict(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device="cpu",
+            enable_mkldnn=False,
+        )
+        if os.path.isdir(det_v5):
+            new_kwargs["text_detection_model_name"] = "PP-OCRv5_server_det"
+            new_kwargs["text_detection_model_dir"] = det_v5
+        if os.path.isdir(rec_v5):
+            new_kwargs["text_recognition_model_name"] = Path(rec_v5).name
+            new_kwargs["text_recognition_model_dir"] = rec_v5
+
+        try:
+            self._ocr = PaddleOCR(**new_kwargs)
+            self._new_api = True
+            return
+        except Exception:
+            pass
+
+        old_kwargs = dict(lang="en", use_angle_cls=False, enable_mkldnn=False)
+        det_old = os.path.join(paddle_dir, "whl/det/en/en_PP-OCRv3_det_infer") if paddle_dir else ""
+        rec_old = os.path.join(paddle_dir, "whl/rec/en/en_PP-OCRv4_rec_infer") if paddle_dir else ""
+        if os.path.isdir(det_old):
+            old_kwargs["det_model_dir"] = det_old
+        if os.path.isdir(rec_old):
+            old_kwargs["rec_model_dir"] = rec_old
+        try:
+            self._ocr = PaddleOCR(**old_kwargs)
+        except ValueError:
+            old_kwargs.pop("enable_mkldnn", None)
+            self._ocr = PaddleOCR(**old_kwargs)
+
+    @staticmethod
+    def _find_paddle_model_dir(model_dir: str) -> str:
+        base = Path(model_dir)
+        here = Path(__file__).resolve().parent
+        candidates = [
+            base / "paddleocr",
+            base.parent / "models" / "paddleocr",
+            here / "models" / "paddleocr",
+            here / "ROLL_NUMBER" / "models" / "paddleocr",
+        ]
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        return ""
+    
+    def run(self, img_bgr: np.ndarray) -> list:
+        """Run OCR and return list of (text, confidence) tuples."""
+        results = []
+        try:
+            if self._new_api:
+                out = self._ocr.predict(
+                    img_bgr,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=320,
+                    text_det_limit_type="max",
+                )
+                if out:
+                    for block in out:
+                        if not isinstance(block, dict):
+                            continue
+                        texts = block.get("rec_texts", None) or block.get("rec_text", [])
+                        scores = block.get("rec_scores", None) or block.get("rec_score", [])
+                        polys = block.get("dt_polys", []) or block.get("rec_polys", []) or block.get("rec_boxes", [])
+                        
+                        if not isinstance(texts, list):
+                            texts, scores = [texts], [scores]
+                            polys = [polys] if polys is not None else []
+                        
+                        items = []
+                        for i, (t, s) in enumerate(zip(texts, scores)):
+                            if not t: continue
+                            y_center = 0
+                            if i < len(polys) and polys[i] is not None and len(polys[i]) > 0:
+                                poly = np.array(polys[i])
+                                if len(poly.shape) == 2 and poly.shape[1] == 2:
+                                    y_center = np.mean(poly[:, 1])
+                                elif len(poly) >= 2:
+                                    y_center = poly[1] if isinstance(poly[1], (int, float, np.number)) else 0
+                            items.append((y_center, str(t), float(s or 0)))
+                        
+                        # Sort top to bottom
+                        items.sort(key=lambda x: x[0])
+                        for _, t, s in items:
+                            results.append((t, s))
+            else:
+                out = self._ocr.ocr(img_bgr)
+                if out and out[0]:
+                    items = []
+                    for line in out[0]:
+                        if line and len(line) >= 2:
+                            poly = line[0]
+                            txt, conf = line[1]
+                            y_center = np.mean([pt[1] for pt in poly]) if poly else 0
+                            items.append((y_center, str(txt), float(conf or 0)))
+                    
+                    items.sort(key=lambda x: x[0])
+                    for _, t, s in items:
+                        results.append((t, s))
+        except Exception:
+            pass
+        return results
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Class
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrafficViolationDetector:
-    def __init__(self, model_dir: str = "./models"):
+    def __init__(self, model_dir: str = None):
+        if model_dir is None:
+            local_models = Path(__file__).parent / "models"
+            local_best = Path(__file__).parent / "best_model"
+            parent_best = Path(__file__).parent.parent / "best_model"
+            if local_models.exists():
+                model_dir = str(local_models)
+            elif local_best.exists():
+                model_dir = str(local_best)
+            else:
+                model_dir = str(parent_best)
         self.model_dir = Path(model_dir)
         self.debug = os.environ.get("TVD_DEBUG", "").strip().lower() in ("1", "true", "yes")
         self._load_models()
@@ -317,101 +521,57 @@ class TrafficViolationDetector:
         
         self.plate_ocr = None
         self._plate_ocr_attempted = False
-        self.ocr_reader = None
         
         # Eagerly load OCR
         self._ensure_plate_ocr()
 
     def _ensure_plate_ocr(self):
+        """Ensure PaddleOCR is loaded."""
         if self.plate_ocr is not None:
             return True
         if self._plate_ocr_attempted:
             return False
         self._plate_ocr_attempted = True
         try:
-            from fast_plate_ocr import LicensePlateRecognizer
-            self.plate_ocr = LicensePlateRecognizer("cct-s-v2-global-model", device="cpu")
-        except Exception:
+            self.plate_ocr = _OCRWrapper(str(self.model_dir))
+        except Exception as e:
+            print(f"[WARN] PaddleOCR failed to load: {e}")
             self.plate_ocr = None
         return self.plate_ocr is not None
 
     def _run_plate_ocr(self, crop) -> list[str]:
+        """Run PaddleOCR once on the original plate crop."""
         texts = []
         if crop is None or crop.size == 0:
             return texts
 
-        if self._ensure_plate_ocr():
-            try:
-                h, w = crop.shape[:2]
-                aspect_ratio = h / w if w > 0 else 0
-                
-                # 1. Upscale tiny crops to guarantee clear Transformer attention
-                if h < 64 or w < 200:
-                    scale = max(64.0 / h, 200.0 / w)
-                    crop_for_preproc = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-                else:
-                    crop_for_preproc = crop
-                
-                # 2. Generate 6 Pre-processing variants
-                gray = cv2.cvtColor(crop_for_preproc, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
-                sharpened = np.clip(cv2.filter2D(clahe, -1, np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])), 0, 255).astype(np.uint8)
-                _, binary = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-                morphed = cv2.erode(cv2.dilate(clahe, kernel), kernel)
-                
-                variants = [
-                    crop,
-                    cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
-                    cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR),
-                    cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
-                    cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR),
-                    cv2.cvtColor(morphed, cv2.COLOR_GRAY2BGR)
-                ]
-                
-                # Run OCR on all 6 variants of the crop
-                for var in variants:
-                    result = self.plate_ocr.run(var)
-                    primary_text = ""
-                    if isinstance(result, (list, tuple)) and len(result) > 0:
-                        primary_text = str(getattr(result[0], "plate", result[0]))
-                    elif result:
-                        primary_text = str(getattr(result, "plate", result))
-                    
-                    if primary_text:
-                        texts.append(_clean_plate_text(primary_text))
-                
-                # 3. Smart Splitter for Stacked Plates (Aspect Ratio > 0.45)
-                if aspect_ratio > 0.45:
-                    mid = h // 2
-                    top_half = crop[0:mid+5, :]
-                    bottom_half = crop[mid-5:h, :]
-                    
-                    # Split raw, CLAHE, and Morphed crops
-                    for var in [crop, cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR), cv2.cvtColor(morphed, cv2.COLOR_GRAY2BGR)]:
-                        vh, vw = var.shape[:2]
-                        vmid = vh // 2
-                        v_top = var[0:vmid+5, :]
-                        v_bot = var[vmid-5:vh, :]
-                        
-                        top_res = self.plate_ocr.run(v_top)
-                        bot_res = self.plate_ocr.run(v_bot)
-                        
-                        t_txt = str(getattr(top_res[0], "plate", top_res[0])) if top_res else ""
-                        b_txt = str(getattr(bot_res[0], "plate", bot_res[0])) if bot_res else ""
-                        
-                        if t_txt or b_txt:
-                            texts.append(_clean_plate_text(f"{t_txt}{b_txt}"))
-            except Exception:
-                pass
+        if not self._ensure_plate_ocr():
+            return texts
 
-        # Relaxed filter: return segments that are at least 3 characters long
-        deduped = []
-        for text in texts:
-            if len(text) >= 3 and text not in deduped:
-                deduped.append(text)
-        return deduped
+        try:
+            best_text, best_score = "UNKNOWN", 0.0
+
+            ocr_out = self.plate_ocr.run(crop)
+            if not ocr_out:
+                return texts
+
+            combined_txt = "".join(t for t, _ in ocr_out)
+            combined_conf = sum(c for _, c in ocr_out) / len(ocr_out)
+
+            for txt, conf in [(combined_txt, combined_conf)] + ocr_out:
+                cleaned = _clean_plate(txt)
+                if cleaned == "UNKNOWN" or len(cleaned) < 4:
+                    continue
+                score = conf + _plate_quality(cleaned)
+                if score > best_score:
+                    best_score, best_text = score, cleaned
+            
+            if best_text != "UNKNOWN":
+                texts.append(best_text)
+        except Exception:
+            pass
+        
+        return texts
 
     def _triple_model_votes_true(self, crop) -> bool:
         if self.triple_model is None or crop is None or crop.size == 0:
@@ -535,10 +695,14 @@ class TrafficViolationDetector:
         candidates.sort(key=lambda c: c["conf"], reverse=True)
         return candidates
 
-    def predict(self, image_path: str) -> dict:
+    def predict(self, image_path) -> dict:
         violations = []
         try:
-            img = cv2.imread(str(image_path))
+            # Handle both file paths (str) and numpy arrays
+            if isinstance(image_path, str):
+                img = cv2.imread(str(image_path))
+            else:
+                img = image_path
             if img is None: return {"violations": []}
             h, w = img.shape[:2]
 
@@ -642,7 +806,7 @@ class TrafficViolationDetector:
                 # 4. Plate Detection & OCR
                 plate_candidates = self._get_plate_candidates(img, (bx1, by1, bx2, by2))
                 all_texts = []
-                for candidate in plate_candidates[:3]:
+                for candidate in plate_candidates[:1]:
                     all_texts.extend(self._run_plate_ocr(candidate["crop"]))
                 
                 # Final Violation Assembly
